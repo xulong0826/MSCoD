@@ -82,7 +82,7 @@ visual:
 
 train:
   batch_size: !SUB ${batch_size}
-  num_workers: 8
+  num_workers: 16
   pos_noise_std: !SUB ${pos_noise_std}
   random_rot: !SUB ${random_rot}
   val_freq: 1000
