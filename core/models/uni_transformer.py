@@ -8,6 +8,162 @@ from torch_scatter import scatter_softmax, scatter_sum
 from core.models.common import GaussianSmearing, MLP, batch_hybrid_edge_connection, outer_product
 
 
+# 信息瓶颈模块
+class InformationBottleneckWithGating(nn.Module):
+    def __init__(self, input_dim, bottleneck_dim, output_dim, kl_weight=1e-3, activation_fn=F.relu):
+        super().__init__()
+        # 定义网络层
+        self.fc_mean = nn.Linear(input_dim, bottleneck_dim)
+        self.fc_logvar = nn.Linear(input_dim, bottleneck_dim)
+        self.fc_expand = nn.Linear(bottleneck_dim, output_dim)
+        self.fc_gate = nn.Linear(input_dim, bottleneck_dim)  # 门控层
+
+        # 为瓶颈层添加 FFN 和 Sigmoid
+        self.ffn_bottleneck = nn.Linear(bottleneck_dim, bottleneck_dim)
+        self.sigmoid_bottleneck = nn.Sigmoid()
+
+        self.activation_fn = activation_fn  # 激活函数
+
+    def forward(self, h, mask_ligand, batch_mask, custom_activation=None):
+        act_fn = custom_activation if custom_activation else self.activation_fn
+
+        # 通过 mask_ligand 来区分蛋白质和配体
+        protein_mask = (mask_ligand == 0) & batch_mask
+        ligand_mask = (mask_ligand == 1) & batch_mask
+
+        # 提取蛋白质和配体特征
+        h_protein = h * protein_mask.unsqueeze(-1)
+        h_ligand = h * ligand_mask.unsqueeze(-1)
+
+        # 使用共享的 fc_mean 和 fc_logvar 层计算均值和对数方差
+        protein_mean, protein_logvar = self.fc_mean(h_protein), self.fc_logvar(h_protein)
+        ligand_mean, ligand_logvar = self.fc_mean(h_ligand), self.fc_logvar(h_ligand)
+
+        # 重参数化技巧
+        protein_std, ligand_std = torch.exp(0.5 * protein_logvar), torch.exp(0.5 * ligand_logvar)
+        protein_eps, ligand_eps = torch.randn_like(protein_std), torch.randn_like(ligand_std)
+        protein_bottleneck = protein_mean + protein_eps * protein_std
+        ligand_bottleneck = ligand_mean + ligand_eps * ligand_std
+
+        # 添加门控机制，使用共享的 fc_gate 层
+        protein_gate = torch.sigmoid(self.fc_gate(h_protein))  # 对蛋白质特征进行门控
+        ligand_gate = torch.sigmoid(self.fc_gate(h_ligand))  # 对配体特征进行门控
+
+        # 将瓶颈特征和门控机制结合
+        protein_bottleneck_gated = protein_bottleneck * protein_gate
+        ligand_bottleneck_gated = ligand_bottleneck * ligand_gate
+
+        # 通过 FFN 和 Sigmoid 激活处理瓶颈层输出
+        # FFN 和 Sigmoid 激活用于对瓶颈特征进行调整
+        protein_bottleneck_gated = self.ffn_bottleneck(protein_bottleneck_gated)
+        protein_bottleneck_gated = self.sigmoid_bottleneck(protein_bottleneck_gated)
+
+        ligand_bottleneck_gated = self.ffn_bottleneck(ligand_bottleneck_gated)
+        ligand_bottleneck_gated = self.sigmoid_bottleneck(ligand_bottleneck_gated)
+
+        # 通过激活函数处理瓶颈层输出
+        protein_output = act_fn(self.fc_expand(protein_bottleneck_gated))
+        ligand_output = act_fn(self.fc_expand(ligand_bottleneck_gated))
+
+        # 合并蛋白质和配体的输出
+        h_updated = h.clone()
+
+        # 残差连接：将更新后的特征与输入特征相加
+        h_updated[protein_mask] = protein_output + h_protein[protein_mask]
+        h_updated[ligand_mask] = ligand_output + h_ligand[ligand_mask]
+
+        return h_updated
+
+
+# 协同注意力模块
+class MultiHeadCoAttentionWithGating(nn.Module):
+    def __init__(self, feature_dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.attention_dim = feature_dim // num_heads
+
+        # 多头线性变换
+        self.protein_linears = nn.ModuleList(
+            [nn.Linear(feature_dim, self.attention_dim, bias=False) for _ in range(num_heads)])
+        self.ligand_linears = nn.ModuleList(
+            [nn.Linear(feature_dim, self.attention_dim, bias=False) for _ in range(num_heads)])
+
+        # 上下文特征更新层
+        self.protein_updates = nn.ModuleList([nn.Linear(self.attention_dim, feature_dim) for _ in range(num_heads)])
+        self.ligand_updates = nn.ModuleList([nn.Linear(self.attention_dim, feature_dim) for _ in range(num_heads)])
+
+        # 注意力权重和归一化
+        self.attention_weights = nn.ParameterList(
+            [nn.Parameter(torch.randn(self.attention_dim)) for _ in range(num_heads)])
+        self.norm_layer = nn.LayerNorm(self.attention_dim)  # 归一化层
+
+        # 门控机制
+        self.protein_gate = nn.Linear(feature_dim, self.attention_dim)  # 蛋白质门控
+        self.ligand_gate = nn.Linear(feature_dim, self.attention_dim)  # 配体门控
+        self.gate_merge = nn.Linear(2 * self.attention_dim, self.attention_dim)  # 融合门控
+
+        # FFN 层用于瓶颈调整
+        self.ffn_bottleneck = nn.Linear(self.attention_dim, self.attention_dim)
+        self.sigmoid_bottleneck = nn.Sigmoid()
+
+        # 输出融合
+        self.final_layer = nn.Linear(num_heads * feature_dim, feature_dim)  # 多头输出融合
+
+    def forward(self, h, mask_ligand, batch_mask):
+        protein_batch_mask = (mask_ligand == 0) & batch_mask
+        ligand_batch_mask = (mask_ligand == 1) & batch_mask
+
+        h_protein = h[protein_batch_mask]
+        h_ligand = h[ligand_batch_mask]
+
+        # 多头投影和上下文特征计算
+        protein_contexts, ligand_contexts = [], []
+        for head_idx in range(self.num_heads):
+            # 多头投影
+            protein_feat = self.protein_linears[head_idx](h_protein)  # (N_p, attention_dim)
+            ligand_feat = self.ligand_linears[head_idx](h_ligand)  # (N_l, attention_dim)
+
+            # 计算注意力得分
+            attention_scores = torch.matmul(protein_feat, ligand_feat.T) / (self.attention_dim ** 0.5)  # (N_p, N_l)
+            protein_attention = F.softmax(attention_scores, dim=-1)  # 对配体归一化
+            ligand_attention = F.softmax(attention_scores.T, dim=-1)  # 对蛋白质归一化
+
+            # 上下文特征
+            protein_context = torch.matmul(protein_attention, ligand_feat)  # (N_p, attention_dim)
+            ligand_context = torch.matmul(ligand_attention, protein_feat)  # (N_l, attention_dim)
+
+            # 门控机制
+            protein_gate = torch.sigmoid(self.protein_gate(h_protein))  # (N_p, attention_dim)
+            ligand_gate = torch.sigmoid(self.ligand_gate(h_ligand))  # (N_l, attention_dim)
+
+            protein_context = self.norm_layer(protein_context * protein_gate)  # 归一化加权
+            ligand_context = self.norm_layer(ligand_context * ligand_gate)
+
+            # 引入 FFN 和 Sigmoid 激活进行调整
+            protein_context = self.ffn_bottleneck(protein_context)
+            protein_context = self.sigmoid_bottleneck(protein_context)
+
+            ligand_context = self.ffn_bottleneck(ligand_context)
+            ligand_context = self.sigmoid_bottleneck(ligand_context)
+
+            protein_contexts.append(self.protein_updates[head_idx](protein_context))  # (N_p, feature_dim)
+            ligand_contexts.append(self.ligand_updates[head_idx](ligand_context))  # (N_l, feature_dim)
+
+        # 汇总所有头
+        protein_final = torch.cat(protein_contexts, dim=-1)  # (N_p, num_heads * feature_dim)
+        ligand_final = torch.cat(ligand_contexts, dim=-1)  # (N_l, num_heads * feature_dim)
+
+        # 多头融合
+        protein_final = self.final_layer(protein_final)  # (N_p, feature_dim)
+        ligand_final = self.final_layer(ligand_final)  # (N_l, feature_dim)
+
+        # 残差连接：将更新后的特征与输入特征相加
+        h_updated = h.clone()
+        h_updated[protein_batch_mask] = protein_final + h_protein  # 蛋白质残差连接
+        h_updated[ligand_batch_mask] = ligand_final + h_ligand  # 配体残差连接
+
+        return h_updated
+
 class BaseX2HAttLayer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, n_heads, edge_feat_dim, r_feat_dim,
                  act_fn='relu', norm=True, ew_net_type='r', out_fc=True):
@@ -211,7 +367,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
 
 
 class UniTransformerO2TwoUpdateGeneral(nn.Module):
-    def __init__(self, num_blocks, num_layers, hidden_dim, n_heads=1, knn=32,
+    def __init__(self, num_blocks, num_layers, hidden_dim, n_heads=1, knn=32,bottleneck_dim=32, num_heads=4,
                  num_r_gaussian=50, edge_feat_dim=0, num_node_types=8, act_fn='relu', norm=True,
                  cutoff_mode='radius', ew_net_type='r',
                  num_init_x2h=1, num_init_h2x=0, num_x2h=1, num_h2x=1, r_max=10., x2h_out_fc=True, sync_twoup=False, name='unio2net'):
@@ -246,6 +402,9 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
         self.init_h_emb_layer = self._build_init_h_layer()
         self.base_block = self._build_share_blocks()
 
+        self.infobottle = InformationBottleneckWithGating(input_dim=hidden_dim, bottleneck_dim=bottleneck_dim, output_dim=hidden_dim)
+        self.cottention = MultiHeadCoAttentionWithGating(feature_dim=hidden_dim, num_heads=num_heads)
+
     def __repr__(self):
         return f'UniTransformerO2(num_blocks={self.num_blocks}, num_layers={self.num_layers}, n_heads={self.n_heads}, ' \
                f'act_fn={self.act_fn}, norm={self.norm}, cutoff_mode={self.cutoff_mode}, ew_net_type={self.ew_net_type}, ' \
@@ -260,6 +419,29 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
             ew_net_type=self.ew_net_type, x2h_out_fc=self.x2h_out_fc, sync_twoup=self.sync_twoup,
         )
         return layer
+
+    def _apply_interaction_pipeline(self, h, mask_ligand, batch, num_interactions):
+        # 串联协同注意力和信息瓶颈模块，并重复 num_interactions 次。
+
+        # Parameters:
+        # - h: 当前特征
+        # - mask_ligand: 是否为配体的掩码
+        # - batch: 节点批次
+        # - num_interactions: 重复次数
+
+        # Returns:
+        # - h: 更新后的特征
+        # original_h = h.clone()  # 保存原始特征
+        for i in range(num_interactions):
+            # 协同注意力
+            h = self.cottention(h, mask_ligand, batch)
+            # 信息瓶颈
+            h = self.infobottle(h, mask_ligand, batch)
+
+            # 局部特征残差更新
+            # h = h + original_h  # 加入残差连接，结合原始特征
+
+        return h
 
     def _build_share_blocks(self):
         # Equivariant layers
@@ -319,7 +501,20 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
                 e_w = None
 
             for l_idx, layer in enumerate(self.base_block):
+                # h, x = layer(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x)
+
+                # 只有前几个block才应用残差连接
+                if b_idx > self.num_blocks // 3:  # 例如在后半部分使用残差连接
+                    original_h = h.clone()
+
+                # 更新特征
                 h, x = layer(h, x, edge_type, edge_index, mask_ligand, e_w=e_w, fix_x=fix_x)
+                # 协同注意力与信息瓶颈的串联
+                h = self._apply_interaction_pipeline(h, mask_ligand, batch, num_interactions=1)
+
+                # 局部特征更新：将更新后的特征与原始特征相加（可选）
+                if b_idx > self.num_blocks // 3:  # 仅在后半部分加入残差连接
+                    h = h + original_h  # 加入残差连接，结合原始特征
             all_x.append(x)
             all_h.append(h)
 
