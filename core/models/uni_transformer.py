@@ -12,7 +12,6 @@ from core.models.common import GaussianSmearing, MLP, batch_hybrid_edge_connecti
 class FeatureCompressionMLP(nn.Module):
     def __init__(self, input_dim, bottleneck_dim, output_dim, activation_fn=F.relu):
         super().__init__()
-<<<<<<< HEAD
 
         self.activation_fn = activation_fn
 
@@ -28,30 +27,18 @@ class FeatureCompressionMLP(nn.Module):
 
         # 可学习的参数 alpha，用于残差连接
         self.alpha = nn.Parameter(torch.tensor(0.5))  # 初始化为 0.5，控制残差连接的权重
-=======
-        self.fc_mean = nn.Linear(input_dim, bottleneck_dim)
-        self.fc_logvar = nn.Linear(input_dim, bottleneck_dim)
-        self.fc_expand = nn.Linear(bottleneck_dim, output_dim)
-        self.fc_gate = nn.Linear(input_dim, bottleneck_dim)  # 门控层
-
-        self.activation_fn = activation_fn
->>>>>>> da9bcf68890625b39f284b316de8ff4459504f1c
 
     def forward(self, h, mask_ligand, batch_mask, custom_activation=None):
         act_fn = custom_activation if custom_activation else self.activation_fn
 
-<<<<<<< HEAD
         # 使用 mask_ligand 来区分蛋白质和配体
-=======
-        # 根据 mask_ligand 分割蛋白质和配体特征
->>>>>>> da9bcf68890625b39f284b316de8ff4459504f1c
         protein_mask = (mask_ligand == 0) & batch_mask
         ligand_mask = (mask_ligand == 1) & batch_mask
 
+        # 提取蛋白质和配体特征
         h_protein = h * protein_mask.unsqueeze(-1)
         h_ligand = h * ligand_mask.unsqueeze(-1)
 
-<<<<<<< HEAD
         # 特征压缩：逐步将输入特征压缩到瓶颈维度
         h_protein_compressed = act_fn(self.fc_compress_1(h_protein))
         h_protein_compressed = act_fn(self.fc_compress_2(h_protein_compressed))
@@ -74,27 +61,6 @@ class FeatureCompressionMLP(nn.Module):
         h_updated = h.clone()
         h_updated[protein_mask] = self.alpha * h_protein_expanded + (1 - self.alpha) * h_protein
         h_updated[ligand_mask] = self.alpha * h_ligand_expanded + (1 - self.alpha) * h_ligand
-=======
-        # 均值和方差计算
-        protein_mean, protein_logvar = self.fc_mean(h_protein), self.fc_logvar(h_protein)
-        ligand_mean, ligand_logvar = self.fc_mean(h_ligand), self.fc_logvar(h_ligand)
-
-        # 重参数化
-        protein_bottleneck = protein_mean + torch.randn_like(protein_mean) * torch.exp(0.5 * protein_logvar)
-        ligand_bottleneck = ligand_mean + torch.randn_like(ligand_mean) * torch.exp(0.5 * ligand_logvar)
-
-        # 门控调整
-        protein_gate = torch.sigmoid(self.fc_gate(h_protein))
-        ligand_gate = torch.sigmoid(self.fc_gate(h_ligand))
-
-        protein_output = act_fn(self.fc_expand(protein_bottleneck * protein_gate))
-        ligand_output = act_fn(self.fc_expand(ligand_bottleneck * ligand_gate))
-
-        # 残差连接
-        h_updated = h.clone()
-        h_updated[protein_mask] = protein_output + h_protein[protein_mask]
-        h_updated[ligand_mask] = ligand_output + h_ligand[ligand_mask]
->>>>>>> da9bcf68890625b39f284b316de8ff4459504f1c
 
         return h_updated
 
