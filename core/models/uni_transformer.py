@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,26 +9,29 @@ from torch_scatter import scatter_softmax, scatter_sum
 from core.models.common import GaussianSmearing, MLP, batch_hybrid_edge_connection, outer_product
 
 
-# 信息瓶颈模块
-class InformationBottleneckWithGating(nn.Module):
-    def __init__(self, input_dim, bottleneck_dim, output_dim, kl_weight=1e-3, activation_fn=F.relu):
+class FeatureCompressionMLP(nn.Module):
+    def __init__(self, input_dim, bottleneck_dim, output_dim, activation_fn=F.relu):
         super().__init__()
-        # 定义网络层
-        self.fc_mean = nn.Linear(input_dim, bottleneck_dim)
-        self.fc_logvar = nn.Linear(input_dim, bottleneck_dim)
-        self.fc_expand = nn.Linear(bottleneck_dim, output_dim)
-        self.fc_gate = nn.Linear(input_dim, bottleneck_dim)  # 门控层
 
-        # 为瓶颈层添加 FFN 和 Sigmoid
-        self.ffn_bottleneck = nn.Linear(bottleneck_dim, bottleneck_dim)
-        self.sigmoid_bottleneck = nn.Sigmoid()
+        self.activation_fn = activation_fn
 
-        self.activation_fn = activation_fn  # 激活函数
+        # 压缩层：逐步将输入特征压缩到瓶颈维度
+        self.fc_compress_1 = nn.Linear(input_dim, input_dim // 2)  # 第一层压缩
+        self.fc_compress_2 = nn.Linear(input_dim // 2, input_dim // 4)  # 第二层压缩
+        self.fc_compress_3 = nn.Linear(input_dim // 4, bottleneck_dim)  # 第三层压缩，瓶颈维度
+
+        # 扩展层：逐步将瓶颈维度恢复到输出维度
+        self.fc_expand_1 = nn.Linear(bottleneck_dim, input_dim // 4)  # 第一层恢复
+        self.fc_expand_2 = nn.Linear(input_dim // 4, input_dim // 2)  # 第二层恢复
+        self.fc_expand_3 = nn.Linear(input_dim // 2, output_dim)  # 第三层恢复，输出维度
+
+        # 可学习的参数 alpha，用于残差连接
+        self.alpha = nn.Parameter(torch.tensor(0.5))  # 初始化为 0.5，控制残差连接的权重
 
     def forward(self, h, mask_ligand, batch_mask, custom_activation=None):
         act_fn = custom_activation if custom_activation else self.activation_fn
 
-        # 通过 mask_ligand 来区分蛋白质和配体
+        # 使用 mask_ligand 来区分蛋白质和配体
         protein_mask = (mask_ligand == 0) & batch_mask
         ligand_mask = (mask_ligand == 1) & batch_mask
 
@@ -35,45 +39,30 @@ class InformationBottleneckWithGating(nn.Module):
         h_protein = h * protein_mask.unsqueeze(-1)
         h_ligand = h * ligand_mask.unsqueeze(-1)
 
-        # 使用共享的 fc_mean 和 fc_logvar 层计算均值和对数方差
-        protein_mean, protein_logvar = self.fc_mean(h_protein), self.fc_logvar(h_protein)
-        ligand_mean, ligand_logvar = self.fc_mean(h_ligand), self.fc_logvar(h_ligand)
+        # 特征压缩：逐步将输入特征压缩到瓶颈维度
+        h_protein_compressed = act_fn(self.fc_compress_1(h_protein))
+        h_protein_compressed = act_fn(self.fc_compress_2(h_protein_compressed))
+        h_protein_compressed = act_fn(self.fc_compress_3(h_protein_compressed))
 
-        # 重参数化技巧
-        protein_std, ligand_std = torch.exp(0.5 * protein_logvar), torch.exp(0.5 * ligand_logvar)
-        protein_eps, ligand_eps = torch.randn_like(protein_std), torch.randn_like(ligand_std)
-        protein_bottleneck = protein_mean + protein_eps * protein_std
-        ligand_bottleneck = ligand_mean + ligand_eps * ligand_std
+        h_ligand_compressed = act_fn(self.fc_compress_1(h_ligand))
+        h_ligand_compressed = act_fn(self.fc_compress_2(h_ligand_compressed))
+        h_ligand_compressed = act_fn(self.fc_compress_3(h_ligand_compressed))
 
-        # 添加门控机制，使用共享的 fc_gate 层
-        protein_gate = torch.sigmoid(self.fc_gate(h_protein))  # 对蛋白质特征进行门控
-        ligand_gate = torch.sigmoid(self.fc_gate(h_ligand))  # 对配体特征进行门控
+        # 特征恢复：逐步将瓶颈维度的特征恢复到输出维度
+        h_protein_expanded = act_fn(self.fc_expand_1(h_protein_compressed))
+        h_protein_expanded = act_fn(self.fc_expand_2(h_protein_expanded))
+        h_protein_expanded = self.fc_expand_3(h_protein_expanded)
 
-        # 将瓶颈特征和门控机制结合
-        protein_bottleneck_gated = protein_bottleneck * protein_gate
-        ligand_bottleneck_gated = ligand_bottleneck * ligand_gate
+        h_ligand_expanded = act_fn(self.fc_expand_1(h_ligand_compressed))
+        h_ligand_expanded = act_fn(self.fc_expand_2(h_ligand_expanded))
+        h_ligand_expanded = self.fc_expand_3(h_ligand_expanded)
 
-        # 通过 FFN 和 Sigmoid 激活处理瓶颈层输出
-        # FFN 和 Sigmoid 激活用于对瓶颈特征进行调整
-        protein_bottleneck_gated = self.ffn_bottleneck(protein_bottleneck_gated)
-        protein_bottleneck_gated = self.sigmoid_bottleneck(protein_bottleneck_gated)
-
-        ligand_bottleneck_gated = self.ffn_bottleneck(ligand_bottleneck_gated)
-        ligand_bottleneck_gated = self.sigmoid_bottleneck(ligand_bottleneck_gated)
-
-        # 通过激活函数处理瓶颈层输出
-        protein_output = act_fn(self.fc_expand(protein_bottleneck_gated))
-        ligand_output = act_fn(self.fc_expand(ligand_bottleneck_gated))
-
-        # 合并蛋白质和配体的输出
+        # 使用残差连接：更新蛋白质和配体的特征
         h_updated = h.clone()
-
-        # 残差连接：将更新后的特征与输入特征相加
-        h_updated[protein_mask] = protein_output + h_protein[protein_mask]
-        h_updated[ligand_mask] = ligand_output + h_ligand[ligand_mask]
+        h_updated[protein_mask] = self.alpha * h_protein_expanded + (1 - self.alpha) * h_protein
+        h_updated[ligand_mask] = self.alpha * h_ligand_expanded + (1 - self.alpha) * h_ligand
 
         return h_updated
-
 
 # 协同注意力模块
 class MultiHeadCoAttentionWithGating(nn.Module):
@@ -367,7 +356,7 @@ class AttentionLayerO2TwoUpdateNodeGeneral(nn.Module):
 
 
 class UniTransformerO2TwoUpdateGeneral(nn.Module):
-    def __init__(self, num_blocks, num_layers, hidden_dim, n_heads=1, knn=32,bottleneck_dim=32, num_heads=4,
+    def __init__(self, num_blocks, num_layers, hidden_dim, n_heads=1, knn=32, bottleneck_dim=32, num_heads=4,
                  num_r_gaussian=50, edge_feat_dim=0, num_node_types=8, act_fn='relu', norm=True,
                  cutoff_mode='radius', ew_net_type='r',
                  num_init_x2h=1, num_init_h2x=0, num_x2h=1, num_h2x=1, r_max=10., x2h_out_fc=True, sync_twoup=False, name='unio2net'):
@@ -402,7 +391,7 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
         self.init_h_emb_layer = self._build_init_h_layer()
         self.base_block = self._build_share_blocks()
 
-        self.infobottle = InformationBottleneckWithGating(input_dim=hidden_dim, bottleneck_dim=bottleneck_dim, output_dim=hidden_dim)
+        self.multimlp = FeatureCompressionMLP(input_dim=hidden_dim, bottleneck_dim=bottleneck_dim, output_dim=hidden_dim)
         self.cottention = MultiHeadCoAttentionWithGating(feature_dim=hidden_dim, num_heads=num_heads)
 
     def __repr__(self):
@@ -436,7 +425,7 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
             # 协同注意力
             h = self.cottention(h, mask_ligand, batch)
             # 信息瓶颈
-            h = self.infobottle(h, mask_ligand, batch)
+            h = self.multimlp(h, mask_ligand, batch)
 
             # 局部特征残差更新
             # h = h + original_h  # 加入残差连接，结合原始特征
