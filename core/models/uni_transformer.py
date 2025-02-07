@@ -72,9 +72,11 @@ class MultiHeadCoAttentionWithGating(nn.Module):
         self.ligand_linears = nn.ModuleList([nn.Linear(feature_dim, self.attention_dim, bias=False) for _ in range(num_heads)])
 
         # 更新层
+        self.protein_updates = nn.ModuleList([nn.Linear(self.attention_dim, feature_dim) for _ in range(num_heads)])
         self.ligand_updates = nn.ModuleList([nn.Linear(self.attention_dim, feature_dim) for _ in range(num_heads)])
 
         # 门控机制
+        self.protein_gate = nn.Linear(feature_dim, self.attention_dim)
         self.ligand_gate = nn.Linear(feature_dim, self.attention_dim)
 
         # 最终输出融合层
@@ -83,6 +85,7 @@ class MultiHeadCoAttentionWithGating(nn.Module):
         self.ffn2 = FeedForward(feature_dim)  # 进一步更新特征
 
     def forward(self, h_protein, h_ligand):
+        protein_contexts = []
         ligand_contexts = []
         for head_idx in range(self.num_heads):
             # 多头投影
@@ -91,30 +94,40 @@ class MultiHeadCoAttentionWithGating(nn.Module):
 
             # 计算注意力得分并归一化
             attention_scores = torch.matmul(protein_feat, ligand_feat.T) / (self.attention_dim ** 0.5)
+            protein_attention = F.softmax(attention_scores, dim=-1)
             ligand_attention = F.softmax(attention_scores.T, dim=-1)
 
             # 上下文特征
+            protein_context = torch.matmul(protein_attention, ligand_feat)
             ligand_context = torch.matmul(ligand_attention, protein_feat)
 
             # 门控机制
+            protein_gate = torch.sigmoid(self.protein_gate(h_protein))
             ligand_gate = torch.sigmoid(self.ligand_gate(h_ligand))
+            protein_context = protein_context * protein_gate
             ligand_context = ligand_context * ligand_gate
 
             # 更新
+            protein_contexts.append(self.protein_updates[head_idx](protein_context))
             ligand_contexts.append(self.ligand_updates[head_idx](ligand_context))
 
         # 合并多头结果并通过最终层
+        protein_final = torch.cat(protein_contexts, dim=-1)
         ligand_final = torch.cat(ligand_contexts, dim=-1)
+        protein_final = self.final_layer(protein_final)
         ligand_final = self.final_layer(ligand_final)
 
         # 残差链接之前的处理
+        protein_final = torch.sigmoid(protein_final)
         ligand_final = torch.sigmoid(ligand_final)
+        protein_final = protein_final + h_protein  # 残差连接
         ligand_final = ligand_final + h_ligand  # 残差连接
 
         # 残差连接之后的前馈处理
+        protein_final = self.ffn2(protein_final)
         ligand_final = self.ffn2(ligand_final)
 
-        return h_protein, ligand_final
+        return protein_final, ligand_final
 
 # 综合模型：结合信息瓶颈和协同注意力机制
 class CombinedModel(nn.Module):
