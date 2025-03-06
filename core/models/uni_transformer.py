@@ -8,84 +8,75 @@ from torch_scatter import scatter_softmax, scatter_sum
 
 from core.models.common import GaussianSmearing, MLP, batch_hybrid_edge_connection, outer_product
 
-# GELU激活函数
-class GELU(nn.Module):
-    def forward(self, x):
-        return 0.5 * x * (1 + torch.tanh(
-            math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
-
-# FeedForward模块
-class FeedForward(nn.Module):
-    def __init__(self, d_model=128, dropout=0.1):
-        super(FeedForward, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model)
-        )
-        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
-
-    def forward(self, x):
-        x = self.layer_norm(x)
-        return self.net(x)
-
-# MultiScaleInformationBottleneck（多尺度信息瓶颈）
 class MultiScaleInformationBottleneck(nn.Module):
-    def __init__(self, input_dim, output_dim, dropout=0.1):
+    def __init__(self, input_dim, output_dim):
         super().__init__()
-
         self.bottleneck_dims = [16, 32, 64]
         self.bottlenecks = nn.ModuleList()
-        self.layer_norm = nn.LayerNorm(output_dim, eps=1e-6)
-
+        
         for bottleneck_dim in self.bottleneck_dims:
             self.bottlenecks.append(nn.Sequential(
                 nn.Linear(input_dim, bottleneck_dim),
-                GELU(),
-                nn.Dropout(dropout),
+                nn.ReLU(),
                 nn.Linear(bottleneck_dim, output_dim),
+                nn.ReLU()  # 添加激活函数
             ))
-        
-        self.ffn1 = FeedForward(output_dim, dropout)  # 进一步处理瓶颈特征
+        self.ffn = nn.Sequential(
+            nn.Linear(output_dim, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim),
+            nn.ReLU()  # 添加激活函数
+        )
+        self.norm = nn.LayerNorm(output_dim)
 
     def forward(self, h):
-        h = self.layer_norm(h)  # 对输入进行一次归一化
-        concatenated_features = h
-
+        original_features = h
+        concatenated_features = original_features
         for bottleneck in self.bottlenecks:
             scale_features = bottleneck(h)
-            concatenated_features = concatenated_features + scale_features  # 特征拼接
+            concatenated_features = concatenated_features + scale_features
 
-        output = self.ffn1(concatenated_features)
-        return output
+        concatenated_features = self.norm(concatenated_features)
+        output = self.ffn(concatenated_features)
+        return output  # 返回经过 FFN 处理后的特征
 
-# MultiHeadCoAttentionWithGating（多头协同注意力机制，带门控）
 class MultiHeadCoAttentionWithGating(nn.Module):
     def __init__(self, feature_dim, num_heads):
         super().__init__()
         self.num_heads = num_heads
         self.attention_dim = feature_dim // num_heads
 
-        # 多头投影
+        # 多头线性变换
         self.protein_linears = nn.ModuleList([nn.Linear(feature_dim, self.attention_dim, bias=False) for _ in range(num_heads)])
         self.ligand_linears = nn.ModuleList([nn.Linear(feature_dim, self.attention_dim, bias=False) for _ in range(num_heads)])
 
         # 更新层
-        self.protein_updates = nn.ModuleList([nn.Linear(self.attention_dim, feature_dim) for _ in range(num_heads)])
         self.ligand_updates = nn.ModuleList([nn.Linear(self.attention_dim, feature_dim) for _ in range(num_heads)])
 
         # 门控机制
-        self.protein_gate = nn.Linear(feature_dim, self.attention_dim)
         self.ligand_gate = nn.Linear(feature_dim, self.attention_dim)
+        self.gate_merge = nn.Linear(2 * self.attention_dim, self.attention_dim)
 
-        # 最终输出融合层
+        # 输出融合层
         self.final_layer = nn.Linear(num_heads * feature_dim, feature_dim)
 
-        self.ffn2 = FeedForward(feature_dim)  # 进一步更新特征
+        # 归一化层
+        self.norm = nn.LayerNorm(feature_dim)
+
+        # 前馈神经网络
+        self.ffn_pre = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.ReLU(),
+            nn.Linear(feature_dim, feature_dim)
+        )
+
+        self.ffn_post = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.ReLU(),
+            nn.Linear(feature_dim, feature_dim)
+        )
 
     def forward(self, h_protein, h_ligand):
-        protein_contexts = []
         ligand_contexts = []
         for head_idx in range(self.num_heads):
             # 多头投影
@@ -94,51 +85,58 @@ class MultiHeadCoAttentionWithGating(nn.Module):
 
             # 计算注意力得分并归一化
             attention_scores = torch.matmul(protein_feat, ligand_feat.T) / (self.attention_dim ** 0.5)
-            protein_attention = F.softmax(attention_scores, dim=-1)
             ligand_attention = F.softmax(attention_scores.T, dim=-1)
 
             # 上下文特征
-            protein_context = torch.matmul(protein_attention, ligand_feat)
             ligand_context = torch.matmul(ligand_attention, protein_feat)
 
             # 门控机制
-            protein_gate = torch.sigmoid(self.protein_gate(h_protein))
             ligand_gate = torch.sigmoid(self.ligand_gate(h_ligand))
-            protein_context = protein_context * protein_gate
             ligand_context = ligand_context * ligand_gate
 
             # 更新
-            protein_contexts.append(self.protein_updates[head_idx](protein_context))
             ligand_contexts.append(self.ligand_updates[head_idx](ligand_context))
 
-        # 合并多头结果并通过最终层
-        protein_final = torch.cat(protein_contexts, dim=-1)
+        # 合并头并通过最终层
         ligand_final = torch.cat(ligand_contexts, dim=-1)
-        protein_final = self.final_layer(protein_final)
         ligand_final = self.final_layer(ligand_final)
 
         # 残差链接之前的处理
-        protein_final = torch.sigmoid(protein_final)
+        ligand_final = self.ffn_pre(ligand_final)
         ligand_final = torch.sigmoid(ligand_final)
-        protein_final = protein_final + h_protein  # 残差连接
-        ligand_final = ligand_final + h_ligand  # 残差连接
 
-        # 残差连接之后的前馈处理
-        protein_final = self.ffn2(protein_final)
-        ligand_final = self.ffn2(ligand_final)
+        # 残差链接
+        ligand_final = ligand_final + h_ligand
 
-        return protein_final, ligand_final
+        # 归一化
+        ligand_final = self.norm(ligand_final)
 
-# 综合模型：结合信息瓶颈和协同注意力机制
+        # 残余链接之后的处理
+        ligand_final = self.ffn_post(ligand_final)
+
+        return h_protein, ligand_final
+
+# 综合模型：信息瓶颈和协同注意力机制结合
 class CombinedModel(nn.Module):
     def __init__(self, input_dim, output_dim, feature_dim, num_heads):
         super(CombinedModel, self).__init__()
-        self.spp = MultiScaleInformationBottleneck(input_dim, output_dim)
-        self.co_attention = MultiHeadCoAttentionWithGating(feature_dim, num_heads)
+        self.spp = MultiScaleInformationBottleneck(input_dim, output_dim)  # 使用SPP进行特征提取
+        self.co_attention = MultiHeadCoAttentionWithGating(feature_dim, num_heads)  # 使用交叉注意力机制
 
-        # 最终前馈网络
-        self.ffn3 = FeedForward(feature_dim)
+        # 前馈神经网络
+        self.ffn_pre = nn.Sequential(
+            nn.Linear(output_dim, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim)
+        )
 
+        self.ffn_post = nn.Sequential(
+            nn.Linear(output_dim, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim)
+        )
+
+        # 归一化层
         self.norm = nn.LayerNorm(output_dim)
 
     def forward(self, h, mask_ligand, batch):
@@ -146,7 +144,7 @@ class CombinedModel(nn.Module):
         protein_final_list, ligand_final_list = [], []
 
         for i in range(batch_size):
-            # 为每个批次分离蛋白质和配体特征
+            # 分离每个批次的蛋白质和配体特征
             protein_batch_mask = ((batch == i) & (mask_ligand == 0))
             ligand_batch_mask = ((batch == i) & (mask_ligand == 1))
 
@@ -154,23 +152,30 @@ class CombinedModel(nn.Module):
             ligand_features = h[ligand_batch_mask]    # (num_ligand_atoms, input_dim)
 
             # 使用SPP模块进行特征提取
-            protein_features = self.spp(protein_features)  # (num_protein_atoms, output_dim)
-            ligand_features = self.spp(ligand_features)    # (num_ligand_atoms, output_dim)
+            protein_features = self.spp(protein_features)  # (num_protein_atoms, spp_out_dim)
+            ligand_features = self.spp(ligand_features)    # (num_ligand_atoms, spp_out_dim)
 
             # 使用交叉注意力机制进行特征交互
             protein_final, ligand_final = self.co_attention(protein_features, ligand_features)
 
             # 残差链接之前的处理
+            protein_final = self.ffn_pre(protein_final)
             protein_final = torch.sigmoid(protein_final)
+
+            ligand_final = self.ffn_pre(ligand_final)
             ligand_final = torch.sigmoid(ligand_final)
 
             # 残差链接
             protein_final = protein_final + protein_features
             ligand_final = ligand_final + ligand_features
 
+            # 归一化
+            protein_final = self.norm(protein_final)
+            ligand_final = self.norm(ligand_final)
+
             # 残余链接之后的处理
-            protein_final = self.ffn3(protein_final)
-            ligand_final = self.ffn3(ligand_final)
+            protein_final = self.ffn_post(protein_final)
+            ligand_final = self.ffn_post(ligand_final)
 
             protein_final_list.append(protein_final)
             ligand_final_list.append(ligand_final)
