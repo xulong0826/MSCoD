@@ -1,7 +1,5 @@
-# MolCRAFT
-Official implementation of ICML 2024 ["MolCRAFT: Structure-Based Drug Design in Continuous Parameter Space"](https://arxiv.org/abs/2404.12141).
-
-🎉 Our demo is now available at [120.240.170.153:10990](120.240.170.153:10990). The formal version will be at [http://gensi-thuair.com:10990/](http://gensi-thuair.com:10990/) soon. Welcome to have a try!
+# MSCoD
+Official implementation of ["MSCoD :A Multi-Scale Co-Attention Framework for Structure-Based Drug Design"]().
 
 ## Environment
 It is highly recommended to install via docker if a Linux server with NVIDIA GPU is available.
@@ -92,7 +90,7 @@ For binding affinity (Vina Score / Min / Dock) and molecular properties (QED, SA
 For PoseCheck (strain energy, clashes) and other conformational results (bond length, bond angle, torsion angle, RMSD), please refer to `test` folder.
 
 ### Evaluating meta files
-We provide samples for all SBDD baselines in the [sample](https://drive.google.com/drive/folders/1A3Mthm9ksbfUnMCe5T2noGsiEV1RfChH?usp=sharing) Google Drive folder.
+We provide samples for all SBDD baselines in the [sample]() Google Drive folder.
 
 You may download the `all_samples.tar.gz` and then `tar xzvf all_samples.tar.gz`, which extracts all the pt files into `samples` folder for evaluation.
 
