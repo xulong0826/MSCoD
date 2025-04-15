@@ -87,5 +87,3 @@ For PoseCheck (strain energy, clashes) and other conformational results (bond le
 We provide samples for all SBDD baselines in the [sample]() Google Drive folder.
 
 You may download the `all_samples.tar.gz` and then `tar xzvf all_samples.tar.gz`, which extracts all the pt files into `samples` folder for evaluation.
-
-Great thanks to @duerrsimon for his kind support in resolving rendering issues! -->
