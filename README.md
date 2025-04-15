@@ -1,6 +1,9 @@
 # MSCoD
 Official implementation of ["MSCoD :A Multi-Scale Co-Attention Framework for Structure-Based Drug Design"]().
 
+## Acknowledgements
+We thank the authors of MolCRAFT: Structure-Based Drug Design in Continuous Parameter Space for releasing their code. The code in this repository is based on their source code release (https://github.com/AlgoMole/MolCRAFT). If you find this code useful, please consider citing their work.
+
 ## Environment
 It is highly recommended to install via docker if a Linux server with NVIDIA GPU is available.
 
@@ -64,7 +67,7 @@ python train_bfn.py --no_wandb --debug --epochs 1
 ```
 
 ## Sampling
-We provide the pretrained checkpoint as [last.ckpt](https://drive.google.com/file/d/1a1laBFYRNqaMpcS3Id0L0R6XoLEk4gDG/view?usp=share_link). 
+We provide the pretrained checkpoint as [last.ckpt](). 
 
 ### Sampling for pockets in the testset
 Run `make evaluate -f scripts.mk`, or alternatively,
@@ -73,15 +76,6 @@ python train_bfn.py --config_file configs/default.yaml --exp_name ${EXP_NAME} --
 ```
 
 The output molecules `vina_docked.pt` for all 100 test pockets will be saved in `./logs/${USER}_bfn_sbdd/${EXP_NAME}/${REVISION}/test_outputs/${TIMESTAMP}` folders.
-
-### Sampling from pdb file
-To sample from a whole protein pdb file, we need the corresponding reference ligand to clip the protein pocket (a 10A region around the reference position).
-
-Below is an example that stores the generated 10 molecules under `output` folder. The configurations are managed in the ``call()`` function of ``sample_for_pocket.py``.
-
-```bash
-python sample_for_pocket.py ${PDB_PATH} ${SDF_PATH}
-```
 
 ## Evaluation
 ### Evaluating molecules
@@ -94,27 +88,4 @@ We provide samples for all SBDD baselines in the [sample]() Google Drive folder.
 
 You may download the `all_samples.tar.gz` and then `tar xzvf all_samples.tar.gz`, which extracts all the pt files into `samples` folder for evaluation.
 
-<!-- ## Demo
-### Host our web app demo locally
-
-With ``gradio`` and ``gradio_molecule3d`` installed, you can simply run ``python app.py`` to open the demo locally. Port mapping has been set in Makefile if you are using docker. You should also forward this port if you run the docker in an ssh server. We will share a permanent demo link later.
-
 Great thanks to @duerrsimon for his kind support in resolving rendering issues! -->
-
-## Citation
-
-```
-@article{qu2024molcraft,
-  title={MolCRAFT: Structure-Based Drug Design in Continuous Parameter Space},
-  author={Qu, Yanru and Qiu, Keyue and Song, Yuxuan and Gong, Jingjing and Han, Jiawei and Zheng, Mingyue and Zhou, Hao and Ma, Wei-Ying},
-  journal={ICML 2024},
-  year={2024}
-}
-
-@article{song2024unified,
-  title={Unified Generative Modeling of 3D Molecules via Bayesian Flow Networks},
-  author={Song, Yuxuan and Gong, Jingjing and Qu, Yanru and Zhou, Hao and Zheng, Mingyue and Liu, Jingjing and Ma, Wei-Ying},
-  journal={ICLR 2024},
-  year={2024}
-}
-```
