@@ -98,10 +98,10 @@ revision: default
 seed: 1234
 test_only: false
 train:
-  batch_size: 8
+  batch_size: 4
   ckpt_freq: 1
   ema_decay: 0.999
-  epochs: 15
+  epochs: 25
   max_grad_norm: Q
   num_workers: 8
   optimizer:
