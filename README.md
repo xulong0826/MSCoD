@@ -1,50 +1,56 @@
 # MSCoD
-Official implementation of ["MSCoD :A Multi-Scale Co-Attention Framework for Structure-Based Drug Design"]().
+Official implementation of ["MSCoD: An Enhanced Bayesian Updating Framework with Multi-Scale Information Bottleneck and Cooperative Attention for Structure-Based Drug Design"]().
 
 ## Acknowledgements
-We thank the authors of MolCRAFT: Structure-Based Drug Design in Continuous Parameter Space for releasing their code. The code in this repository is based on their source code release (https://github.com/AlgoMole/MolCRAFT). If you find this code useful, please consider citing their work.
+We thank the authors of MolCRAFT: Structure-Based Drug Design in Continuous Parameter Space for releasing their code. The code in this repository is based on their source code release [MolCRAFT](https://github.com/AlgoMole/MolCRAFT). If you find this code useful, please consider citing their work.
 
 ## Environment
-It is highly recommended to install via docker if a Linux server with NVIDIA GPU is available.
 
-Otherwise, you might check [README for env](docker/README.md) for further details of docker or conda setup.
+You can build your own environment through `conda env create -f mscod.yml`. Here the main packages are listed:
 
-### Prerequisite
-A docker with `nvidia-container-runtime` enabled on your Linux system is required.
+| Package           | Version   |
+|-------------------|-----------|
+| CUDA              | 11.6      |
+| NumPy             | 1.23.1    |
+| Python            | 3.9       |
+| PyTorch           | 1.12.0    |
+| PyTorch Geometric | 2.1.0     |
+| RDKit             | 2023.9.5  |
 
-> [!TIP]
-> - This repo provides an easy-to-use script to install docker and nvidia-container-runtime, in `./docker` run `sudo ./setup_docker_for_host.sh` to set up your host machine.
-> - For details, please refer to the [install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+For evaluation, you will need to install `vina` (affinity), `posecheck` (clash, strain energy, and key interactions), and `spyrmsd` (rmsd).
 
-
-### Install via Docker
-We highly recommend you to set up the environment via docker, since all you need to do is a simple `make` command.
 ```bash
-cd ./docker
-make
-```
+# for vina docking
+pip install meeko==0.1.dev3 scipy pdb2pqr vina==1.2.2 
+python -m pip install git+https://github.com/Valdes-Tresanco-MS/AutoDockTools_py3
 
+# for posecheck evaluation
+git clone https://github.com/cch1999/posecheck.git
+cd posecheck
+git checkout 57a1938  # the calculation of strain energy used in our paper
+pip install -e .
+pip install -r requirements.txt
+conda install -c mx reduce
+
+# for spyrmsd
+conda install spyrmsd -c conda-forge
+```
 
 -----
 ## Data
-Data used for training / evaluating the model should be put in the `data` folder by default, and accessible in the [data](https://drive.google.com/drive/folders/16KiwfMGUIk4a6mNU20GnUd0ah-mjNlhC?usp=share_link) Google Drive folder.
+Data used for training/evaluating the model should be placed in the `data` folder by default, and is accessible in the [data](https://drive.google.com/drive/folders/1j21cc7-97TedKh_El5E34yI8o5ckI7eK) Google Drive folder (from [Targetdiff](https://github.com/guanjq/targetdiff)).
 
-To train the model from scratch, download the lmdb file and split file into data folder:
+To train the model from scratch, download the lmdb file and split file into the data folder:
 * `crossdocked_v1.1_rmsd1.0_pocket10_processed_final.lmdb`
 * `crossdocked_pocket10_pose_split.pt`
 
-To evaluate the model on the test set, download _and_ unzip the `test_set.zip` into data folder. It includes the original PDB files that will be used in Vina Docking.
-
-By default, We transform the lmdb further into the featurized dataset as `crossdocked_v1.1_rmsd1.0_pocket10_add_aromatic_transformed_simple.pt` as described in `transform.py`, which might take several minutes. To enable accelerated training, the yaml file will be set as follows:
-
-```yaml
-data:
-  name: pl_tr # [pl, pl_tr] where tr means offline-transformed
-```
+To evaluate the model on the test set, download and unzip the `test_set.zip` into the data folder. It includes the original PDB files that will be used in Vina Docking.
 
 ---
+
 ## Training
-Run `make -f scripts.mk` (without the need for data preparation), or alternatively (with data folder correctly configured),
+alternatively (with data folder correctly configured):
+
 ```bash
 python train_bfn.py --exp_name ${EXP_NAME} --revision ${REVISION}
 ```
@@ -55,22 +61,21 @@ python train_bfn.py --sigma1_coord 0.03 --beta1 1.5 --lr 5e-4 --time_emb_dim 1 -
 ```
 
 ### Testing
-For quick evaluation of the official checkpoint, refer to `make evaluate` in `scripts.mk`:
+For quick evaluation of the official checkpoint:
 ```bash
 python train_bfn.py --test_only --no_wandb --ckpt_path ./checkpoints/last.ckpt
 ```
 
 ### Debugging
-For quick debugging training process, run `make debug -f scripts.mk`:
+For quick debugging training process, run:
 ```bash
 python train_bfn.py --no_wandb --debug --epochs 1
 ```
 
 ## Sampling
-We provide the pretrained checkpoint as [last.ckpt](). 
+We provide the pretrained checkpoint as [last.ckpt](https://drive.google.com/drive/folders/1seq3iQswNg9AsHObEf2opNlnYj0ojWnF?usp=drive_link). 
 
 ### Sampling for pockets in the testset
-Run `make evaluate -f scripts.mk`, or alternatively,
 ```bash
 python train_bfn.py --config_file configs/default.yaml --exp_name ${EXP_NAME} --revision ${REVISION} --test_only --num_samples ${NUM_MOLS_PER_POCKET} --sample_steps 100
 ```
@@ -81,9 +86,24 @@ The output molecules `vina_docked.pt` for all 100 test pockets will be saved in 
 ### Evaluating molecules
 For binding affinity (Vina Score / Min / Dock) and molecular properties (QED, SA), it is calculated upon sampling.
 
-For PoseCheck (strain energy, clashes) and other conformational results (bond length, bond angle, torsion angle, RMSD), please refer to `test` folder.
+For PoseCheck (strain energy, clashes) and other conformational results (bond length, bond angle, torsion angle, RMSD), please refer to `eval/caculate_all_metrics` folder.
+
+### Usage Instructions for Comprehensive Metrics Calculation
+1. Obtain the vina_docked.pt file.
+2. Run 1_add_rmsd_pt.py followed by 2_add_pose_pt.py.
+3. After these steps, you will have vina_docked_pose_checked.pt.
+Finally, run 3_all_metrics.py to calculate all the metrics described in the paper.
 
 ### Evaluating meta files
-We provide samples for all SBDD baselines in the [sample]() Google Drive folder.
+We provide samples for all SBDD baselines in the [sample](https://drive.google.com/drive/folders/1seq3iQswNg9AsHObEf2opNlnYj0ojWnF?usp=drive_link) Google Drive folder.
 
-You may download the `all_samples.tar.gz` and then `tar xzvf all_samples.tar.gz`, which extracts all the pt files into `samples` folder for evaluation.
+## Example: 7xkj Pocket Evaluation
+Usage Instructions
+### First, generate ligands and obtain the JSON file containing some metrics:
+1. python eval/7xkj/sample_for_pocket.py /home/xulong/AI/Codes/MSCoD/MSCoD/7xkj_gdp/7xkj_A_rec.pdb /home/xulong/AI/Codes/MSCoD/MSCoD/7xkj_gdp/7xkj_A_rec_7xkj_lig_gdp.sdf
+2. python eval/7xkj/sample_for_pocket.py /home/xulong/AI/Codes/MSCoD/MSCoD/7xkj_6ic/7xkj_A_rec.pdb /home/xulong/AI/Codes/MSCoD/MSCoD/7xkj_6ic/7xkj_A_rec_7xkj_lig_6ic.sdf
+### Then, run the following command to visualize the results:
+1. python view.py
+
+## Contact
+If you have any questions or issues, please feel free to contact us via email(xulong0826@outlook.com) or open an issue in this repository.
