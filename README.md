@@ -6,7 +6,6 @@ We thank the authors of MolCRAFT: Structure-Based Drug Design in Continuous Para
 
 ## Environment
 ![Methods](https://github.com/xulong0826/MSCoD/blob/main/MSCoD.png)
-![Results](https://github.com/xulong0826/MSCoD/blob/main/results.png)
 
 You can build your own environment through `conda env create -f mscod.yml`. Here the main packages are listed:
 
