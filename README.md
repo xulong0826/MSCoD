@@ -5,6 +5,8 @@ Official implementation of ["MSCoD: An Enhanced Bayesian Updating Framework with
 We thank the authors of MolCRAFT: Structure-Based Drug Design in Continuous Parameter Space for releasing their code. The code in this repository is based on their source code release [MolCRAFT](https://github.com/AlgoMole/MolCRAFT). If you find this code useful, please consider citing their work.
 
 ## Environment
+![https://github.com/xulong0826/MSCoD/blob/main/MSCoD_png.pdf]
+![https://github.com/xulong0826/MSCoD/blob/main/results.pdf]
 
 You can build your own environment through `conda env create -f mscod.yml`. Here the main packages are listed:
 
