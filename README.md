@@ -1,5 +1,5 @@
 # MSCoD
-Official implementation of ["MSCoD: An Enhanced Bayesian Updating Framework with Multi-Scale Information Bottleneck and Cooperative Attention for Structure-Based Drug Design"]().
+Official implementation of ["MSCoD: An Enhanced Bayesian Updating Framework with Multi-Scale Information Bottleneck and Cooperative Attention for Structure-Based Drug Design"](https://arxiv.org/abs/2509.25225).
 
 ## Acknowledgements
 We thank the authors of MolCRAFT: Structure-Based Drug Design in Continuous Parameter Space for releasing their code. The code in this repository is based on their source code release [MolCRAFT](https://github.com/AlgoMole/MolCRAFT). If you find this code useful, please consider citing their work.
