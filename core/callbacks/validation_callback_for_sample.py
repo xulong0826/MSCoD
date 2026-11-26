@@ -63,6 +63,9 @@ class DockingTestCallback(Callback):
     
     def setup(self, trainer: Trainer, pl_module: LightningModule, stage: str) -> None:
         super().setup(trainer, pl_module, stage)
+        # where the generated SDFs go; set by the caller to the pocket's folder
+        # (cfg.accounting.sampling_out_dir), falling back to ./output
+        self.out_dir = getattr(pl_module.cfg.accounting, 'sampling_out_dir', OUT_DIR)
         self.metric = CondMolGenMetric(
             atom_decoder=self.atom_decoder,
             atom_enc_mode=self.atom_enc_mode,
@@ -101,9 +104,9 @@ class DockingTestCallback(Callback):
             shutil.rmtree(path)
         os.makedirs(path, exist_ok=True)
 
-        if os.path.exists(OUT_DIR):
-            shutil.rmtree(OUT_DIR)
-        os.makedirs(OUT_DIR, exist_ok=True)
+        if os.path.exists(self.out_dir):
+            shutil.rmtree(self.out_dir)
+        os.makedirs(self.out_dir, exist_ok=True)
 
         for idx, res in enumerate(tqdm(results, desc="Chem eval")):
             
@@ -131,7 +134,7 @@ class DockingTestCallback(Callback):
     
             # print(json.dumps(chem_results, indent=4, cls=NpEncoder))
 
-            out_fn = os.path.join(OUT_DIR, f'{idx}.sdf')
+            out_fn = os.path.join(self.out_dir, f'{idx}.sdf')
             with Chem.SDWriter(out_fn) as w:
                 w.write(mol)
 

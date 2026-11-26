@@ -80,13 +80,13 @@ dynamics:
 empty_folder: false
 evaluation:
   batch_size: 100
-  ckpt_path: ./checkpoints/last.ckpt
+  ckpt_path: ./checkpoints/mscod_last.ckpt
   docking_config:
     exhaustiveness: 16
     mode: vina_score
     protein_root: ./
   ligand_path: 'null'
-  num_samples: 10
+  num_samples: 300
   protein_path: 'null'
   sample_num_atoms: prior
   sample_steps: 100

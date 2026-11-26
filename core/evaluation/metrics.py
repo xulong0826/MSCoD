@@ -14,7 +14,6 @@ from typing import List, Dict, Tuple
 from tqdm import tqdm
 import numpy as np
 import os
-from posecheck import PoseCheck
 from copy import deepcopy
 from core.evaluation.basic_results import BasicResults
 # from redock_pt_results import redock
@@ -61,6 +60,9 @@ class CondMolGenMetric(object):
         return stability_dict
 
     def compute_chem_results(self, generated: list[dict]):
+        # imported here so that training/generation doesn't require posecheck
+        from posecheck import PoseCheck
+
         # chem_list = []
         pc = PoseCheck()
         last_protein_fn = None

@@ -1,7 +1,22 @@
-# import argparse
+import argparse
 import os
 import sys
+import time
+
+# When this script is run from the repository root (`code/`), the local
+# `posecheck/` source folder shadows the installed `posecheck` package and is
+# treated as a namespace package (`posecheck.__file__ is None`), which breaks
+# `from posecheck import PoseCheck`. Prepend the repo's parent so the real
+# package under `code/posecheck/posecheck/` is resolved.
+_POSECHECK_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posecheck")
+if os.path.isdir(os.path.join(_POSECHECK_ROOT, "posecheck")) and _POSECHECK_ROOT not in sys.path:
+    sys.path.insert(0, _POSECHECK_ROOT)
+
 import json
+import multiprocessing as mp
+import numpy as np
+import pandas as pd
+from pathlib import Path
 # import shutil
 
 # import torch
@@ -80,6 +95,7 @@ def get_dataloader_from_pdb(cfg):
     # dataloader
     collate_exclude_keys = ["ligand_nbh_list"]
     test_set = [transform(data)] * cfg.evaluation.num_samples
+    ##----------------------------- num_samples ---------------------------##
     cfg.evaluation.num_samples = 1
     test_loader = DataLoader(
         test_set,
@@ -95,9 +111,15 @@ def get_dataloader_from_pdb(cfg):
     return test_loader
 
 
+def output_dir_for(protein_fn):
+    """Default output directory: <protein_dir>/output"""
+    return os.path.join(os.path.dirname(os.path.abspath(protein_fn)), 'output')
+
+
 def call(protein_fn, ligand_fn, ckpt_path='./checkpoints/last.ckpt',
-         num_samples=10, sample_steps=100, sample_num_atoms='prior', 
-         beta1=1.5, sigma1_coord=0.03, sampling_strategy='end_back', seed=1234):
+         num_samples=100, sample_steps=100, sample_num_atoms='prior', 
+         beta1=1.5, sigma1_coord=0.03, sampling_strategy='end_back', seed=1234,
+         out_dir=None, ablate_idx=None, backbone_only=False):
     
     cfg = Config('./checkpoints/config.yaml')
     seed_everything(cfg.seed)
@@ -116,6 +138,11 @@ def call(protein_fn, ligand_fn, ckpt_path='./checkpoints/last.ckpt',
     cfg.seed = seed
     cfg.train.max_grad_norm = 'Q'
 
+    # Where the generated SDFs are written; DockingTestCallback reads this
+    # via cfg.accounting.sampling_out_dir (falling back to ./output).
+    if out_dir is not None:
+        cfg.accounting.sampling_out_dir = out_dir
+
     # print(f"The config of this process is:\n{cfg}")
 
     print(protein_fn, ligand_fn)
@@ -123,6 +150,34 @@ def call(protein_fn, ligand_fn, ckpt_path='./checkpoints/last.ckpt',
     # wandb_logger.log_hyperparams(cfg.todict())
 
     model = SBDDTrainLoop(config=cfg)
+
+    # Leave-one-out ablation of the MSFP pathways (indices 0/1/2 = r1/r2/r3).
+    # Patched BEFORE the checkpoint is loaded, so the weights are restored into
+    # the same modules while the forward pass skips the chosen pathway.
+    if ablate_idx is not None:
+        spp = model.dynamics.unio2net.combinedmodel.spp
+        _bn = spp.bottlenecks
+        _norm = spp.norm
+        _ffn = spp.ffn
+        def _ablated(h):
+            feat = h
+            for i, bneck in enumerate(_bn):
+                if i == ablate_idx:
+                    continue
+                feat = feat + bneck(h)
+            return _ffn(_norm(feat))
+        spp.forward = _ablated
+        ratios = [0.125, 0.25, 0.5]
+        print(f'[ABLATE] skipping MSFP pathway {ablate_idx} (ratio {ratios[ablate_idx]})')
+
+    # Backbone-only timing mode: skip the entire MSCoD block (MSFP + MHCA + FFN),
+    # leaving the pure SE(3) message-passing backbone, which is the MolCRAFT
+    # baseline. Used to measure the inference overhead of the added modules.
+    if backbone_only:
+        def _noop(h, mask_ligand, batch):
+            return h
+        model.dynamics.unio2net.combinedmodel.forward = _noop
+        print('[BACKBONE-ONLY] skipping MSFP + MHCA + FFN (MolCRAFT-equivalent backbone)')
 
     trainer = pl.Trainer(
         default_root_dir=cfg.accounting.logdir,
@@ -144,15 +199,20 @@ def call(protein_fn, ligand_fn, ckpt_path='./checkpoints/last.ckpt',
         ],
     )
 
+    _t0 = time.perf_counter()
     trainer.test(model, dataloaders=test_loader, ckpt_path=cfg.evaluation.ckpt_path)
+    _t1 = time.perf_counter()
+    print(f'[TIMING] sampling wall-clock: {_t1 - _t0:.2f} s')
 
 
 class Metrics:
-    def __init__(self, protein_fn, ref_ligand_fn, ligand_fn):
-        self.protein_fn = protein_fn
-        self.ref_ligand_fn = ref_ligand_fn
-        self.ligand_fn = ligand_fn
+    def __init__(self, protein_fn, ref_ligand_fn, ligand_fn, cpu=1):
+        self.protein_fn = os.path.abspath(protein_fn)
+        self.ref_ligand_fn = os.path.abspath(ref_ligand_fn)
+        self.ligand_fn = os.path.abspath(ligand_fn)
         self.exhaustiveness = 16
+        self.cpu = cpu
+        print(f"protein_fn: {self.protein_fn}, ref_ligand_fn: {self.ref_ligand_fn}, ligand_fn: {self.ligand_fn}")
 
     def vina_dock(self, mol):
         chem_results = {}
@@ -163,11 +223,10 @@ class Metrics:
             chem_results['atom_num'] = mol.GetNumAtoms()
 
             # docking                
-            vina_task = VinaDockingTask.from_generated_mol(
-                mol, ligand_filename=self.ref_ligand_fn, protein_root='./')
-            score_only_results = vina_task.run(mode='score_only', exhaustiveness=self.exhaustiveness)
-            minimize_results = vina_task.run(mode='minimize', exhaustiveness=self.exhaustiveness)
-            docking_results = vina_task.run(mode='dock', exhaustiveness=self.exhaustiveness)
+            vina_task = VinaDockingTask(self.protein_fn, mol)
+            score_only_results = vina_task.run(mode='score_only', exhaustiveness=self.exhaustiveness, cpu=self.cpu)
+            minimize_results = vina_task.run(mode='minimize', exhaustiveness=self.exhaustiveness, cpu=self.cpu)
+            docking_results = vina_task.run(mode='dock', exhaustiveness=self.exhaustiveness, cpu=self.cpu)
 
             chem_results['vina_score'] = score_only_results[0]['affinity']
             chem_results['vina_minimize'] = minimize_results[0]['affinity']
@@ -262,11 +321,248 @@ class NpEncoder(json.JSONEncoder):
         return super(NpEncoder, self).default(obj)
 
 
-if __name__ == '__main__':
-    protein_path = sys.argv[1]
-    ligand_path = sys.argv[2]
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NpEncoder, self).default(obj)
 
-    call(protein_path, ligand_path)
-    out_fn = 'output/0.sdf'
-    metrics = Metrics(protein_path, ligand_path, out_fn).evaluate()
-    print(json.dumps(metrics, indent=4, cls=NpEncoder))
+def calculate_boxplot_stats(data_list, metric_name):
+    """计算单个指标的箱线图统计数据"""
+    if len(data_list) == 0:
+        return None
+    
+    data = np.array(data_list)
+    
+    stats = {
+        'count': len(data),
+        'mean': float(np.mean(data)),
+        'median': float(np.median(data)),
+        'std': float(np.std(data)),
+        'min': float(np.min(data)),
+        'max': float(np.max(data)),
+        'q1': float(np.percentile(data, 25)),
+        'q3': float(np.percentile(data, 75)),
+        'iqr': float(np.percentile(data, 75) - np.percentile(data, 25)),
+    }
+    
+    # 计算箱线图的须线
+    stats['lower_whisker'] = max(stats['min'], stats['q1'] - 1.5 * stats['iqr'])
+    stats['upper_whisker'] = min(stats['max'], stats['q3'] + 1.5 * stats['iqr'])
+    
+    # 找出异常值
+    outliers = data[(data < stats['lower_whisker']) | (data > stats['upper_whisker'])]
+    stats['outliers'] = outliers.tolist()
+    stats['num_outliers'] = len(outliers)
+    
+    return stats
+
+def analyze_all_metrics(all_metrics):
+    """分析所有指标的统计数据"""
+    if not all_metrics:
+        print("没有可用的指标数据")
+        return None
+    
+    # 定义需要分析的指标
+    metrics_to_analyze = [
+        'qed', 'sa', 'lipinski', 'logp', 'atom_num',
+        'vina_score', 'vina_minimize', 'vina_dock',
+        'strain', 'clash', 'hb_donor', 'hb_acceptor', 
+        'vdw', 'hydrophobic'
+    ]
+    
+    stats_results = {}
+    
+    print("\n" + "="*100)
+    print("箱线图统计分析结果")
+    print("="*100)
+    print(f"{'指标':<15} {'数量':<6} {'均值':<10} {'中位数':<10} {'标准差':<8} {'最小值':<8} {'最大值':<8} {'Q1':<8} {'Q3':<8} {'异常值':<6}")
+    print("-"*100)
+    
+    for metric in metrics_to_analyze:
+        # 提取该指标的所有值
+        values = []
+        for sample in all_metrics:
+            if metric in sample and sample[metric] is not None:
+                try:
+                    values.append(float(sample[metric]))
+                except (ValueError, TypeError):
+                    continue
+        
+        if values:
+            stats = calculate_boxplot_stats(values, metric)
+            stats_results[metric] = stats
+            
+            print(f"{metric:<15} {stats['count']:<6} {stats['mean']:<10.3f} {stats['median']:<10.3f} "
+                  f"{stats['std']:<8.3f} {stats['min']:<8.3f} {stats['max']:<8.3f} "
+                  f"{stats['q1']:<8.3f} {stats['q3']:<8.3f} {stats['num_outliers']:<6}")
+    
+    print("="*100)
+    
+    return stats_results
+
+def print_key_insights(stats_results):
+    """打印关键洞察"""
+    print("\n" + "="*60)
+    print("关键指标详细分析")
+    print("="*60)
+    
+    key_metrics = {
+        'vina_dock': 'Vina对接得分 (越负越好)',
+        'qed': 'QED药物相似性 (0-1, 越高越好)', 
+        'sa': 'SA合成可达性 (1-10, 越低越好)',
+        'lipinski': '越大越好)',
+        'strain': '应变能 (越低越好)',
+        'clash': '原子冲突数 (越少越好)'
+    }
+    
+    for metric, description in key_metrics.items():
+        if metric in stats_results:
+            stats = stats_results[metric]
+            print(f"\n{metric.upper()} - {description}")
+            print(f"  均值: {stats['mean']:.3f} ± {stats['std']:.3f}")
+            print(f"  中位数: {stats['median']:.3f}")
+            print(f"  范围: [{stats['min']:.3f}, {stats['max']:.3f}]")
+            print(f"  四分位距(IQR): {stats['iqr']:.3f}")
+            print(f"  异常值: {stats['num_outliers']} 个")
+            
+            # 特殊建议
+            if metric == 'vina_dock':
+                good_binding = sum(1 for v in [s.get('vina_dock') for s in all_metrics] if v and v < -8.0)
+                print(f"  强结合分子 (<-8.0): {good_binding}/{stats['count']} ({good_binding/stats['count']*100:.1f}%)")
+            
+            elif metric == 'qed':
+                drug_like = sum(1 for v in [s.get('qed') for s in all_metrics] if v and v > 0.5)
+                print(f"  药物相似性好 (>0.5): {drug_like}/{stats['count']} ({drug_like/stats['count']*100:.1f}%)")
+
+def save_results(all_metrics, stats_results, prefix="docking_analysis", out_dir=None):
+    """保存分析结果；out_dir 指定输出目录（默认当前目录）"""
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        prefix = os.path.join(out_dir, prefix)
+    # 保存原始数据
+    with open(f'{prefix}_raw_data.json', 'w') as f:
+        json.dump(all_metrics, f, indent=2, cls=NpEncoder)
+    
+    # 保存统计结果
+    with open(f'{prefix}_stats.json', 'w') as f:
+        json.dump(stats_results, f, indent=2, cls=NpEncoder)
+    
+    print(f"\n结果已保存:")
+    print(f"  原始数据: {prefix}_raw_data.json")
+    print(f"  统计分析: {prefix}_stats.json")
+
+def evaluation_only(protein_path, ligand_path):
+    """只进行评估，不生成新分子"""
+    print("开始评估现有配体...")
+    
+    # 直接对指定的配体文件进行评估
+    try:
+        metrics = Metrics(protein_path, ligand_path, ligand_path).evaluate()
+        metrics['sample_id'] = 'reference'
+        
+        print("评估完成！")
+        print(json.dumps(metrics, indent=2, cls=NpEncoder))
+        
+        # 保存单个结果
+        with open('reference_ligand_evaluation.json', 'w') as f:
+            json.dump(metrics, f, indent=2, cls=NpEncoder)
+        
+        print(f"\n结果已保存到: reference_ligand_evaluation.json")
+        return metrics
+        
+    except Exception as e:
+        print(f"评估失败: {e}")
+        return None
+
+def _eval_one(args):
+    protein_path, ligand_path, out_fn, i, cpu = args
+    try:
+        m = Metrics(protein_path, ligand_path, out_fn, cpu=cpu)
+        res = m.evaluate()
+        res['sample_id'] = i
+        return res
+    except Exception as e:
+        print(f"Sample {i}: 评估失败 - {e}")
+        return None
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description='Generate molecules for a pocket and evaluate all metrics')
+    ap.add_argument('protein_path')
+    ap.add_argument('ligand_path')
+    ap.add_argument('--out_dir', default=None,
+                    help='output directory for generated SDFs and the summary JSON (default: <protein_dir>/output)')
+    ap.add_argument('--eval-only', action='store_true', help='only evaluate the given reference ligand')
+    ap.add_argument('--num_samples', type=int, default=100, help='number of molecules to generate')
+    ap.add_argument('--sample_steps', type=int, default=100, help='number of sampling steps')
+    ap.add_argument('--ckpt', default='./checkpoints/last.ckpt', help='checkpoint path')
+    ap.add_argument('--ablate', choices=['none', 'r1', 'r2', 'r3'], default='none',
+                    help='leave-one-out ablation: disable one MSFP pathway')
+    ap.add_argument('--backbone-only', action='store_true',
+                    help='skip the whole MSCoD block (MSFP+MHCA+FFN) for MolCRAFT-equivalent timing')
+    ap.add_argument('--timing-only', action='store_true',
+                    help='stop after sampling (skip Vina/PoseCheck evaluation) for pure timing')
+    ap.add_argument('--n_cpu', type=int, default=4, help='number of parallel workers for molecule evaluation')
+    args = ap.parse_args()
+
+    protein_path = args.protein_path
+    ligand_path = args.ligand_path
+    out_dir = args.out_dir or output_dir_for(protein_path)
+
+    ablate_map = {'none': None, 'r1': 0, 'r2': 1, 'r3': 2}
+    ablate_idx = ablate_map[args.ablate]
+
+    if args.eval_only:
+        print("运行模式: 仅评估现有配体")
+        evaluation_only(protein_path, ligand_path)
+    else:
+        print("运行模式: 生成新分子并评估")
+        call(protein_path, ligand_path, ckpt_path=args.ckpt, num_samples=args.num_samples,
+             sample_steps=args.sample_steps, out_dir=out_dir, ablate_idx=ablate_idx,
+             backbone_only=args.backbone_only)
+
+        if args.timing_only:
+            print('[DONE] timing-only: skipping Vina/PoseCheck evaluation', flush=True)
+            sys.exit(0)
+
+        all_metrics = []
+        print("正在评估所有生成的分子...")
+        files = []
+        for i in range(args.num_samples):
+            out_fn = os.path.join(out_dir, f'{i}.sdf')
+            if os.path.exists(out_fn):
+                files.append((protein_path, ligand_path, out_fn, i))
+            else:
+                print(f"Sample {i}: 文件不存在")
+
+        # one Vina thread per worker to avoid oversubscription; all cores when single-process
+        vina_cpu = 0 if args.n_cpu == 1 else 1
+        files = [f + (vina_cpu,) for f in files]
+        if files:
+            n_workers = min(args.n_cpu, len(files))
+            print(f"并行评估 {len(files)} 个分子，workers={n_workers}")
+            with mp.Pool(processes=n_workers) as pool:
+                results = pool.map(_eval_one, files)
+            all_metrics = [r for r in results if r is not None]
+
+        print(f"\n总评估样本数: {len(all_metrics)}")
+
+        if all_metrics:
+            stats_results = analyze_all_metrics(all_metrics)
+            if stats_results:
+                print_key_insights(stats_results)
+                prefix = f'docking_analysis_{Path(ligand_path).stem}'
+                save_results(all_metrics, stats_results, prefix=prefix, out_dir=out_dir)
+                print(f"\n分析完成！共分析了 {len(all_metrics)} 个分子的 {len(stats_results)} 项指标。")
+        else:
+            print("没有成功评估任何分子，请检查文件路径和格式。")
+
+    # cmd
+    #python sample_for_pocket.py /home/xulong/AI/Codes/MSCoD/MSCoD/7xkj_gdp/7xkj_A_rec.pdb /home/xulong/AI/Codes/MSCoD/MSCoD/7xkj_gdp/7xkj_A_rec_7xkj_lig_gdp.sdf
+
+    #python sample_for_pocket.py /home/xulong/AI/Codes/MSCoD/MSCoD/7xkj_6ic/7xkj_A_rec.pdb /home/xulong/AI/Codes/MSCoD/MSCoD/7xkj_6ic/7xkj_A_rec_7xkj_lig_6ic.sdf 

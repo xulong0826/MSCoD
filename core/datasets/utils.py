@@ -110,7 +110,7 @@ class PDBProtein(object):
             self.pos.append(np.array([atom['x'], atom['y'], atom['z']], dtype=np.float32))
             self.atom_name.append(atom['atom_name'])
             self.is_backbone.append(atom['atom_name'] in self.BACKBONE_NAMES)
-            self.atom_to_aa_type.append(self.AA_NAME_NUMBER[atom['res_name']])
+            self.atom_to_aa_type.append(self.AA_NAME_NUMBER.get(atom['res_name'], len(self.AA_NAME_NUMBER)))
 
             chain_res_id = '%s_%s_%d_%s' % (atom['chain'], atom['segment'], atom['res_id'], atom['res_insert_id'])
             if chain_res_id not in residues_tmp:
@@ -139,7 +139,7 @@ class PDBProtein(object):
 
         # Process backbone atoms of residues
         for residue in self.residues:
-            self.amino_acid.append(self.AA_NAME_NUMBER[residue['name']])
+            self.amino_acid.append(self.AA_NAME_NUMBER.get(residue['name'], len(self.AA_NAME_NUMBER)))
             self.center_of_mass.append(residue['center_of_mass'])
             for name in self.BACKBONE_NAMES:
                 pos_key = 'pos_%s' % name  # pos_CA, pos_C, pos_N, pos_O
@@ -150,17 +150,17 @@ class PDBProtein(object):
 
     def to_dict_atom(self):
         return {
-            'element': np.array(self.element, dtype=np.long),
+            'element': np.array(self.element, dtype=int),
             'molecule_name': self.title,
             'pos': np.array(self.pos, dtype=np.float32),
-            'is_backbone': np.array(self.is_backbone, dtype=np.bool),
+            'is_backbone': np.array(self.is_backbone, dtype=bool),
             'atom_name': self.atom_name,
-            'atom_to_aa_type': np.array(self.atom_to_aa_type, dtype=np.long)
+            'atom_to_aa_type': np.array(self.atom_to_aa_type, dtype=int)
         }
 
     def to_dict_residue(self):
         return {
-            'amino_acid': np.array(self.amino_acid, dtype=np.long),
+            'amino_acid': np.array(self.amino_acid, dtype=int),
             'center_of_mass': np.array(self.center_of_mass, dtype=np.float32),
             'pos_CA': np.array(self.pos_CA, dtype=np.float32),
             'pos_C': np.array(self.pos_C, dtype=np.float32),
@@ -220,7 +220,7 @@ def parse_sdf_file(path):
         elif path.endswith('.mol2'):
             rdmol = Chem.MolFromMol2File(path, sanitize=False)
         else:
-            raise ValueError
+            raise ValueError(f'unsupported ligand file {path!r}: expected .sdf or .mol2')
     elif isinstance(path, Chem.rdchem.Mol):
         rdmol = path
     else:
@@ -231,7 +231,7 @@ def parse_sdf_file(path):
     # Remove Hydrogens.
     # rdmol = next(iter(Chem.SDMolSupplier(path, removeHs=True)))
     rd_num_atoms = rdmol.GetNumAtoms()
-    feat_mat = np.zeros([rd_num_atoms, len(ATOM_FAMILIES)], dtype=np.compat.long)
+    feat_mat = np.zeros([rd_num_atoms, len(ATOM_FAMILIES)], dtype=int)
     for feat in factory.GetFeaturesForMol(rdmol):
         feat_mat[feat.GetAtomIds(), ATOM_FAMILIES_ID[feat.GetFamily()]] = 1
 
@@ -258,7 +258,7 @@ def parse_sdf_file(path):
         accum_pos += pos[atom_idx] * atom_weight
         accum_mass += atom_weight
     center_of_mass = accum_pos / accum_mass
-    element = np.array(element, dtype=np.int)
+    element = np.array(element, dtype=int)
 
     # in edge_type, we have 1 for single bond, 2 for double bond, 3 for triple bond, and 4 for aromatic bond.
     row, col, edge_type = [], [], []
@@ -269,8 +269,8 @@ def parse_sdf_file(path):
         col += [end, start]
         edge_type += 2 * [BOND_TYPES[bond.GetBondType()]]
 
-    edge_index = np.array([row, col], dtype=np.long)
-    edge_type = np.array(edge_type, dtype=np.long)
+    edge_index = np.array([row, col], dtype=int)
+    edge_type = np.array(edge_type, dtype=int)
 
     perm = (edge_index[0] * rd_num_atoms + edge_index[1]).argsort()
     edge_index = edge_index[:, perm]

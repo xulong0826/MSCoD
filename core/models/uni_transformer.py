@@ -8,45 +8,103 @@ from torch_scatter import scatter_softmax, scatter_sum
 
 from core.models.common import GaussianSmearing, MLP, batch_hybrid_edge_connection, outer_product
 
+
+# ============================================================
+# 模块级辅助函数（新增，不改变任何类的名字/签名）
+# ============================================================
+def _pad_group(feat, group_id, num_groups, max_size):
+    """把按 batch 连续的特征 pad 成 [B, max_size, F]，返回 (padded, mask)。"""
+    N, F = feat.shape[0], feat.shape[-1]
+    device = feat.device
+    counts = torch.bincount(group_id, minlength=num_groups)
+    starts = torch.cumsum(counts, 0) - counts
+    pos = torch.arange(N, device=device) - starts[group_id]
+    padded = torch.zeros(num_groups, max_size, F, dtype=feat.dtype, device=device)
+    mask = torch.ones(num_groups, max_size, dtype=torch.bool, device=device)
+    padded[group_id, pos] = feat
+    mask[group_id, pos] = False
+    return padded, mask
+
+
+def _unpad_group(padded, mask):
+    """[B, max_size, F] -> [N_valid, F]，顺序 = 原 batch 连续顺序。"""
+    return padded[~mask]
+
+
+def _ligand_coattention_batched(co_attn, h_spp, batch, is_protein, is_ligand,
+                                pad_ratio_threshold=3.0):
+    """批量配体协同注意力：padding + 块对角注意力；浪费过大时回退循环。"""
+    protein_feat = h_spp[is_protein]
+    ligand_feat = h_spp[is_ligand]
+    protein_batch = batch[is_protein]
+    ligand_batch = batch[is_ligand]
+
+    B = int(batch.max().item()) + 1
+    np_counts = torch.bincount(protein_batch, minlength=B)
+    nl_counts = torch.bincount(ligand_batch, minlength=B)
+    max_np = int(np_counts.max().item())
+    max_nl = int(nl_counts.max().item())
+
+    total_pairs = int((np_counts * nl_counts).sum().item())
+    batched_pairs = B * max_np * max_nl
+    if batched_pairs > pad_ratio_threshold * total_pairs:
+        # 回退：逐 batch 循环（语义与原实现完全一致）
+        ligand_out = torch.empty_like(ligand_feat)
+        ligand_batch_ids = batch[is_ligand]
+        for b in range(B):
+            protein_mask = (batch == b) & is_protein
+            ligand_mask = (batch == b) & is_ligand
+            _, lf = co_attn(h_spp[protein_mask], h_spp[ligand_mask])
+            ligand_out[ligand_batch_ids == b] = lf
+        return ligand_out
+
+    protein_padded, protein_mask = _pad_group(protein_feat, protein_batch, B, max_np)
+    ligand_padded, ligand_mask = _pad_group(ligand_feat, ligand_batch, B, max_nl)
+    _, ligand_final_padded = co_attn(
+        protein_padded, ligand_padded,
+        protein_pad_mask=protein_mask, ligand_pad_mask=ligand_mask)
+    return _unpad_group(ligand_final_padded, ligand_mask)
+
+
 class MultiScaleInformationBottleneck(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.bottleneck_dims = [16, 32, 64]
         self.bottlenecks = nn.ModuleList()
-        
+
         for bottleneck_dim in self.bottleneck_dims:
             self.bottlenecks.append(nn.Sequential(
                 nn.Linear(input_dim, bottleneck_dim),
                 nn.ReLU(),
                 nn.Linear(bottleneck_dim, output_dim),
-                nn.ReLU()  # 添加激活函数
+                nn.ReLU()
             ))
         self.ffn = nn.Sequential(
             nn.Linear(output_dim, output_dim),
             nn.ReLU(),
             nn.Linear(output_dim, output_dim),
-            nn.ReLU()  # 添加激活函数
+            nn.ReLU()
         )
         self.norm = nn.LayerNorm(output_dim)
 
     def forward(self, h):
-        original_features = h
-        concatenated_features = original_features
+        out = h
         for bottleneck in self.bottlenecks:
-            scale_features = bottleneck(h)
-            concatenated_features = concatenated_features + scale_features
+            out = out + bottleneck(h)
+        out = self.norm(out)
+        out = self.ffn(out)
+        return out
 
-        concatenated_features = self.norm(concatenated_features)
-        output = self.ffn(concatenated_features)
-        return output  # 返回经过 FFN 处理后的特征
 
 class MultiHeadCoAttentionWithGating(nn.Module):
     def __init__(self, feature_dim, num_heads):
         super().__init__()
+        assert feature_dim % num_heads == 0, "feature_dim 必须能被 num_heads 整除"
         self.num_heads = num_heads
+        self.feature_dim = feature_dim
         self.attention_dim = feature_dim // num_heads
 
-        # 多头线性变换
+        # 多头线性变换（保留 ModuleList，权重名不变，checkpoint 兼容）
         self.protein_linears = nn.ModuleList([nn.Linear(feature_dim, self.attention_dim, bias=False) for _ in range(num_heads)])
         self.ligand_linears = nn.ModuleList([nn.Linear(feature_dim, self.attention_dim, bias=False) for _ in range(num_heads)])
 
@@ -55,7 +113,7 @@ class MultiHeadCoAttentionWithGating(nn.Module):
 
         # 门控机制
         self.ligand_gate = nn.Linear(feature_dim, self.attention_dim)
-        self.gate_merge = nn.Linear(2 * self.attention_dim, self.attention_dim)
+        self.gate_merge = nn.Linear(2 * self.attention_dim, self.attention_dim)  # 保留（原代码死代码，checkpoint 兼容）
 
         # 输出融合层
         self.final_layer = nn.Linear(num_heads * feature_dim, feature_dim)
@@ -76,54 +134,70 @@ class MultiHeadCoAttentionWithGating(nn.Module):
             nn.Linear(feature_dim, feature_dim)
         )
 
-    def forward(self, h_protein, h_ligand):
-        ligand_contexts = []
-        for head_idx in range(self.num_heads):
-            # 多头投影
-            protein_feat = self.protein_linears[head_idx](h_protein)
-            ligand_feat = self.ligand_linears[head_idx](h_ligand)
+        self._inv_scale = 1.0 / math.sqrt(self.attention_dim)
+        self._last_attentions = None
 
-            # 计算注意力得分并归一化
-            attention_scores = torch.matmul(protein_feat, ligand_feat.T) / (self.attention_dim ** 0.5)
-            ligand_attention = F.softmax(attention_scores.T, dim=-1)
+    def forward(self, h_protein, h_ligand, protein_pad_mask=None, ligand_pad_mask=None):
+        # 单对（2D）自动升维为 B=1，保持向后兼容
+        squeeze = h_protein.dim() == 2
+        if squeeze:
+            h_protein = h_protein.unsqueeze(0)
+            h_ligand = h_ligand.unsqueeze(0)
+            protein_pad_mask = torch.zeros(1, h_protein.shape[1], dtype=torch.bool, device=h_protein.device)
+            ligand_pad_mask = torch.zeros(1, h_ligand.shape[1], dtype=torch.bool, device=h_ligand.device)
 
-            # 上下文特征
-            ligand_context = torch.matmul(ligand_attention, protein_feat)
+        B, Np, F = h_protein.shape
+        B, Nl, _ = h_ligand.shape
+        H, A = self.num_heads, self.attention_dim
 
-            # 门控机制
-            ligand_gate = torch.sigmoid(self.ligand_gate(h_ligand))
-            ligand_context = ligand_context * ligand_gate
+        ligand_gate = torch.sigmoid(self.ligand_gate(h_ligand))          # [B, Nl, A]
 
-            # 更新
-            ligand_contexts.append(self.ligand_updates[head_idx](ligand_context))
+        # 向量化多头投影
+        Wp = torch.stack([m.weight for m in self.protein_linears])       # [H, A, F]
+        Wl = torch.stack([m.weight for m in self.ligand_linears])        # [H, A, F]
+        protein_feat = torch.einsum('bnf,haf->bhna', h_protein, Wp)      # [B, H, Np, A]
+        ligand_feat = torch.einsum('bnf,haf->bhna', h_ligand, Wl)        # [B, H, Nl, A]
 
-        # 合并头并通过最终层
-        ligand_final = torch.cat(ligand_contexts, dim=-1)
+        # 批量注意力得分
+        scores = torch.einsum('bhpa,bhla->bhpl', protein_feat, ligand_feat) * self._inv_scale  # [B,H,Np,Nl]
+
+        if protein_pad_mask is not None:
+            scores = scores.masked_fill(protein_pad_mask[:, None, :, None], float('-inf'))
+
+        ligand_attention = scores.softmax(dim=2)                         # [B,H,Np,Nl]
+
+        self._last_attentions = ligand_attention.detach().transpose(-1, -2)  # [B,H,Nl,Np]
+
+        # 批量上下文
+        ligand_context = torch.einsum('bhpl,bhpa->bhla', ligand_attention, protein_feat)  # [B,H,Nl,A]
+        ligand_context = ligand_context * ligand_gate[:, None]
+
+        # 向量化多头更新
+        Wu = torch.stack([m.weight for m in self.ligand_updates])        # [H, F, A]
+        bu = torch.stack([m.bias for m in self.ligand_updates])          # [H, F]
+        ligand_contexts = torch.einsum('bhla,hfa->bhlf', ligand_context, Wu) + bu.view(1, H, 1, F)
+
+        # 合并头
+        ligand_final = ligand_contexts.transpose(1, 2).reshape(B, Nl, H * F)
         ligand_final = self.final_layer(ligand_final)
 
-        # 残差链接之前的处理
         ligand_final = self.ffn_pre(ligand_final)
         ligand_final = torch.sigmoid(ligand_final)
-
-        # 残差链接
         ligand_final = ligand_final + h_ligand
-
-        # 归一化
         ligand_final = self.norm(ligand_final)
-
-        # 残余链接之后的处理
         ligand_final = self.ffn_post(ligand_final)
 
+        if squeeze:
+            return h_protein.squeeze(0), ligand_final.squeeze(0)
         return h_protein, ligand_final
 
-# 综合模型：信息瓶颈和协同注意力机制结合
+
 class CombinedModel(nn.Module):
     def __init__(self, input_dim, output_dim, feature_dim, num_heads):
         super(CombinedModel, self).__init__()
-        self.spp = MultiScaleInformationBottleneck(input_dim, output_dim)  # 使用SPP进行特征提取
-        self.co_attention = MultiHeadCoAttentionWithGating(feature_dim, num_heads)  # 使用交叉注意力机制
+        self.spp = MultiScaleInformationBottleneck(input_dim, output_dim)
+        self.co_attention = MultiHeadCoAttentionWithGating(feature_dim, num_heads)
 
-        # 前馈神经网络
         self.ffn_pre = nn.Sequential(
             nn.Linear(output_dim, output_dim),
             nn.ReLU(),
@@ -136,60 +210,39 @@ class CombinedModel(nn.Module):
             nn.Linear(output_dim, output_dim)
         )
 
-        # 归一化层
         self.norm = nn.LayerNorm(output_dim)
 
     def forward(self, h, mask_ligand, batch):
-        batch_size = batch.max().item() + 1
-        protein_final_list, ligand_final_list = [], []
+        is_protein = mask_ligand == 0
+        is_ligand = mask_ligand == 1
 
-        for i in range(batch_size):
-            # 分离每个批次的蛋白质和配体特征
-            protein_batch_mask = ((batch == i) & (mask_ligand == 0))
-            ligand_batch_mask = ((batch == i) & (mask_ligand == 1))
+        h_spp = self.spp(h)
 
-            protein_features = h[protein_batch_mask]  # (num_protein_atoms, input_dim)
-            ligand_features = h[ligand_batch_mask]    # (num_ligand_atoms, input_dim)
+        # ---- 蛋白分支 ----
+        protein_features = h_spp[is_protein]
+        protein_final = self.ffn_pre(protein_features)
+        protein_final = torch.sigmoid(protein_final)
+        protein_final = protein_final + protein_features
+        protein_final = self.norm(protein_final)
+        protein_final = self.ffn_post(protein_final)
 
-            # 使用SPP模块进行特征提取
-            protein_features = self.spp(protein_features)  # (num_protein_atoms, spp_out_dim)
-            ligand_features = self.spp(ligand_features)    # (num_ligand_atoms, spp_out_dim)
+        # ---- 配体分支：批量 + 自适应回退 ----
+        ligand_features = h_spp[is_ligand]
+        ligand_out = _ligand_coattention_batched(
+            self.co_attention, h_spp, batch, is_protein, is_ligand)
 
-            # 使用交叉注意力机制进行特征交互
-            protein_final, ligand_final = self.co_attention(protein_features, ligand_features)
+        ligand_final = self.ffn_pre(ligand_out)
+        ligand_final = torch.sigmoid(ligand_final)
+        ligand_final = ligand_final + ligand_features
+        ligand_final = self.norm(ligand_final)
+        ligand_final = self.ffn_post(ligand_final)
 
-            # 残差链接之前的处理
-            protein_final = self.ffn_pre(protein_final)
-            protein_final = torch.sigmoid(protein_final)
-
-            ligand_final = self.ffn_pre(ligand_final)
-            ligand_final = torch.sigmoid(ligand_final)
-
-            # 残差链接
-            protein_final = protein_final + protein_features
-            ligand_final = ligand_final + ligand_features
-
-            # 归一化
-            protein_final = self.norm(protein_final)
-            ligand_final = self.norm(ligand_final)
-
-            # 残余链接之后的处理
-            protein_final = self.ffn_post(protein_final)
-            ligand_final = self.ffn_post(ligand_final)
-
-            protein_final_list.append(protein_final)
-            ligand_final_list.append(ligand_final)
-
-        # 合并所有批次的特征
-        protein_final = torch.cat(protein_final_list, dim=0)
-        ligand_final = torch.cat(ligand_final_list, dim=0)
-
-        # 更新特征
+        # ---- 重组 ----
         h_updated = h.clone()
-        h_updated[mask_ligand == 0] = protein_final
-        h_updated[mask_ligand == 1] = ligand_final
-
+        h_updated[is_protein] = protein_final
+        h_updated[is_ligand] = ligand_final
         return h_updated
+
 
 class BaseX2HAttLayer(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, n_heads, edge_feat_dim, r_feat_dim,
@@ -199,7 +252,6 @@ class BaseX2HAttLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.n_heads = n_heads
-        self.act_fn = act_fn
         self.edge_feat_dim = edge_feat_dim
         self.r_feat_dim = r_feat_dim
         self.ew_net_type = ew_net_type
@@ -431,7 +483,7 @@ class UniTransformerO2TwoUpdateGeneral(nn.Module):
         self.combinedmodel = CombinedModel(input_dim=hidden_dim, output_dim=hidden_dim, feature_dim=hidden_dim, num_heads=num_heads)
 
     def _apply_interaction_pipeline(self, h, mask_ligand, batch, num_interactions=1):
-        # 串联协同注意力和信息瓶颈模块，并重复 num_interactions 次�?
+        # 串联协同注意力和信息瓶颈模块，并重复 num_interactions 次
         for i in range(num_interactions):
             # 协同注意
             h = self.combinedmodel(h, mask_ligand, batch)

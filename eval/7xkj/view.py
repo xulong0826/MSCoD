@@ -5,6 +5,8 @@ import os
 import pandas as pd
 
 import matplotlib
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
 matplotlib.rcParams['font.sans-serif'] = ['Arial']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
@@ -12,10 +14,10 @@ sns.set_theme(style="whitegrid", palette="muted")
 
 # Multiple JSON files and their labels for comparison
 json_files = [
-    ('6ic_molcraft.json', '6ic_molcraft'),
-    ('6ic_mscod.json', '6ic_mscod'),
-    ('gdp_molcraft.json', 'gdp_molcraft'),
-    ('gdp_mscod.json', 'gdp_mscod'),
+    ('output/molcraft_6ic/docking_analysis_7xkj_A_rec_7xkj_lig_6ic_raw_data.json', '6ic_molcraft'),
+    ('output/mscod_6ic/docking_analysis_7xkj_A_rec_7xkj_lig_6ic_raw_data.json', '6ic_mscod'),
+    ('output/molcraft_gdp/docking_analysis_7xkj_A_rec_7xkj_lig_gdp_raw_data.json', 'gdp_molcraft'),
+    ('output/mscod_gdp/docking_analysis_7xkj_A_rec_7xkj_lig_gdp_raw_data.json', 'gdp_mscod'),
 ]
 
 # Reference ligand data
@@ -43,28 +45,30 @@ for file, label in json_files:
         print(f"File not found: {file}")
 
 metrics = [
-    'qed', 'sa', 'lipinski',
-    'vina_score', 'vina_minimize', 'vina_dock'
+    'qed', 'sa',
+    'vina_score', 'vina_minimize', 'vina_dock',
+    'strain', 'clash'
 ]
 
 metric_labels = {
     'qed': 'QED',
     'sa': 'SA',
-    'lipinski': 'Lipinski',
     'vina_score': 'Vina Score',
     'vina_minimize': 'Vina Minimize',
-    'vina_dock': 'Vina Dock'
+    'vina_dock': 'Vina Dock',
+    'strain': 'SE',
+    'clash': 'Clash'
 }
 
 num_metrics = len(metrics)
 group_labels = list(all_data.keys())
 
-# Horizontal compact layout: all violin plots in one row
-fig_violin, axes_violin = plt.subplots(1, num_metrics, figsize=(3*num_metrics, 4), constrained_layout=True)
-if num_metrics == 1:
-    axes_violin = [axes_violin]
+# Two-row layout: 7 violin plots + 1 clean legend cell
+fig_violin, axes_violin = plt.subplots(2, 4, figsize=(12, 5), constrained_layout=True)
+axes_violin = axes_violin.ravel()
 
 for idx, metric in enumerate(metrics):
+    ax = axes_violin[idx]
     data_to_plot = []
     palette = []
     for label in group_labels:
@@ -72,49 +76,40 @@ for idx, metric in enumerate(metrics):
         values = [item[metric] for item in data if metric in item]
         data_to_plot.append(values)
         palette.append(color_map.get(label, None))
-    
+
     # Plot violin plot
-    sns.violinplot(data=data_to_plot, ax=axes_violin[idx], palette=palette, inner="box")
-    
-    # 对 lipinski 指标设置 y 轴范围限制
-    if metric == 'lipinski':
-        axes_violin[idx].set_ylim(-0.5, 5.5)
-        # 添加最大值参考线
-        axes_violin[idx].axhline(y=5, color='red', linestyle='--', alpha=0.7, linewidth=1)
-        axes_violin[idx].axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1)
-        # 在右侧添加范围标注
-        axes_violin[idx].text(len(group_labels)-0.5, 5.2, 'Max=5', 
-                             fontsize=8, ha='center', color='red')
-    
-    # Add reference ligand points
+    sns.violinplot(data=data_to_plot, ax=ax, palette=palette, inner="box")
+
+    # Add reference ligand points (only for metrics with known reference values)
     for i, label in enumerate(group_labels):
-        # Determine which reference data to use based on label
         if '6ic' in label.lower():
-            ref_value = reference_data['6ic'][metric]
-            color = 'red'
-            marker = 's'  # square
+            ref_value = reference_data['6ic'].get(metric)
+            color, marker = 'red', 's'
         elif 'gdp' in label.lower():
-            ref_value = reference_data['gdp'][metric]
-            color = 'black'
-            marker = 'o'  # circle
+            ref_value = reference_data['gdp'].get(metric)
+            color, marker = 'black', 'o'
         else:
             continue
-        
-        # Plot reference point
-        axes_violin[idx].scatter(i, ref_value, color=color, s=60, marker=marker, 
-                               edgecolors='white', linewidth=2, zorder=10, 
-                               label=f'Ref {label.split("_")[0].upper()}' if i == 0 or (i == 2 and 'gdp' in label.lower()) else "")
-    
-    axes_violin[idx].set_xticks(range(len(group_labels)))
-    axes_violin[idx].set_xticklabels(group_labels, rotation=30, fontsize=8)
-    axes_violin[idx].set_ylabel(metric_labels.get(metric, metric))
-    axes_violin[idx].set_title(metric_labels.get(metric, metric), fontsize=10)
-    axes_violin[idx].grid(axis='y')
-    
-    # Add legend only to the first subplot
-    if idx == 0:
-        axes_violin[idx].legend(loc='upper right', fontsize=6)
+        if ref_value is None:
+            continue
+        ax.scatter(i, ref_value, color=color, s=60, marker=marker,
+                   edgecolors='white', linewidth=2, zorder=10)
 
-fig_violin.suptitle("Comparison with Reference Ligands (QED/SA/Lipinski: higher is better, Vina: lower is better)", fontsize=14, y=1.05)
-plt.savefig('all_metrics_violin_with_reference.png', dpi=200, bbox_inches='tight')
+    ax.set_xticks(range(len(group_labels)))
+    ax.set_xticklabels(group_labels, rotation=30, fontsize=11)
+    ax.set_ylabel(metric_labels.get(metric, metric), fontsize=12)
+    ax.grid(axis='y')
+
+# ---- clean legend in the eighth cell ----
+ax_leg = axes_violin[7]
+ax_leg.axis('off')
+handles = [Patch(color=color_map[l], label=l) for l in group_labels]
+handles += [
+    Line2D([0], [0], marker='s', color='w', markerfacecolor='red', markersize=10, label='Ref 6IC'),
+    Line2D([0], [0], marker='o', color='w', markerfacecolor='black', markersize=10, label='Ref GDP'),
+]
+ax_leg.legend(handles=handles, loc='center', fontsize=11, frameon=True, title=None)
+
+fig_violin.suptitle("Comparison with Reference Ligands (QED/SA: higher is better, Vina/SE/Clash: lower is better)", fontsize=14, y=1.06)
+plt.savefig('7xkj.png', dpi=200, bbox_inches='tight')
 plt.close(fig_violin)
