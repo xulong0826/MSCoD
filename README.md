@@ -180,7 +180,7 @@ Full per-experiment commands and the figure/table mapping are in **[EXPERIMENTS.
 
 ## Checkpoints
 
-The released checkpoint (`mscod_last.ckpt`, 3,204,063 parameters) is trained for 25 epochs (~5 days) on a single RTX 4060 Ti, with the best checkpoint at epoch 8. The corresponding model config is `checkpoints/config.yaml`. Download the weights and place them under `checkpoints/`.
+The released checkpoint (`mscod_last.ckpt`, 3,204,063 parameters) is trained for 25 epochs (~5 days) on a single RTX 4060 Ti, with the best checkpoint at epoch 8. The corresponding model config is `checkpoints/config.yaml`. Download the weights[https://drive.google.com/drive/folders/1seq3iQswNg9AsHObEf2opNlnYj0ojWnF] and place them under `checkpoints/`.
 
 ---
 
