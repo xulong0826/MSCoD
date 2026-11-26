@@ -15,8 +15,6 @@ The two modules add only **+13.4% parameters (+379K)** over MolCRAFT and **+4.9%
 
 We are deeply grateful to the authors of [MolCRAFT](https://github.com/AlgoMole/MolCRAFT) for releasing their code, on which this implementation is built. We also thank the developers of the open-source tools this work relies on: [PoseCheck](https://github.com/cch1999/posecheck), [AutoDock Vina](https://github.com/ccsb-scripps/AutoDock-Vina), [RDKit](https://www.rdkit.org/), [PyTorch Geometric](https://github.com/pyg-team/pytorch_geometric), and [spyrmsd](https://github.com/RMeli/spyrmsd). We thank the anonymous reviewers and the Associate Editor for their constructive and insightful comments, which substantially improved this work.
 
-This work was supported by the National Natural Science Foundation of China (No. 62262044) and the National Natural Science Foundation of Guangxi (No. 2023GXNSFAA026027).
-
 ---
 
 ## Directory Structure
