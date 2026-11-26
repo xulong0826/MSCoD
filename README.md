@@ -82,7 +82,7 @@ conda env create -f mscod.yaml
 conda activate mscod
 ```
 
-Main packages: Python 3.9, PyTorch 1.12, PyTorch Geometric 2.1, RDKit 2023.9, CUDA 11.6.
+Main packages: Python 3.11, PyTorch 2.8, PyTorch Geometric 2.8.1, RDKit 2026.9, CUDA 12.8.
 
 Additional evaluation dependencies:
 
